@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# cws - chrome workspaces: XDG-isolated Chrome instances on one Linux box/LXC.
+#
+# Borrows two ideas:
+#   1. opencode v2 workspaces: isolate an app by pointing the XDG base
+#      directories (config/data/cache/state) at a per-workspace root instead
+#      of touching $HOME. Same box, many identities, zero collisions.
+#   2. tuxee (agent0ai/tuxee): a tiny Debian container with persistent
+#      terminals and in-browser GUI apps - the cheap LXC workload unit this
+#      is designed to run inside.
+#
+# Result: N isolated Chromes (and therefore N parallel Apify/Crawlee actors)
+# on a single LXC, each with its own profile, cache, state, debug port and
+# resource limits.
+
+set -euo pipefail
+
+CWS_VERSION="0.1.0"
+
+# --- paths -----------------------------------------------------------------
+
+cws_root() {
+  if [[ -n "${CWS_ROOT:-}" ]]; then
+    printf '%s\n' "$CWS_ROOT"
+  else
+    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/chrome-workspaces"
+  fi
+}
+
+ws_dir()  { printf '%s/%s\n' "$(cws_root)" "$1"; }
+meta_f()  { printf '%s/meta.env\n' "$(ws_dir "$1")"; }
+
+die() { printf 'cws: %s\n' "$*" >&2; exit 1; }
+
+valid_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] \
+    || die "invalid name '$1' (lowercase letters, digits, dashes; must start with letter/digit)"
+}
+
+# --- chrome discovery --------------------------------------------------------
+
+find_chrome() {
+  if [[ -n "${CWS_CHROME:-}" ]]; then printf '%s\n' "$CWS_CHROME"; return; fi
+  local c
+  for c in google-chrome google-chrome-stable chromium chromium-browser chrome; do
+    if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return; fi
+  done
+  die "no Chrome/Chromium found; set CWS_CHROME=/path/to/chrome"
+}
+
+# --- debug port allocation ---------------------------------------------------
+# Base port 9300; a workspace keeps its port across launches (stable identity).
+alloc_port() {
+  local base="${CWS_PORT_BASE:-9300}" p used
+  used="$(grep -h '^CWS_DEBUG_PORT=' "$(cws_root)"/*/meta.env 2>/dev/null | cut -d= -f2 | sort -n || true)"
+  p="$base"
+  while :; do
+    if ! grep -qx "$p" <<<"$used" && ! port_in_use "$p"; then printf '%s\n' "$p"; return; fi
+    p=$((p + 1))
+    (( p < base + 1000 )) || die "no free debug port in $base..$((base+999))"
+  done
+}
+
+port_in_use() {
+  # true if something is listening on $1
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$" && return 0
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$" && return 0
+  fi
+  return 1
+}
+
+# --- workspace env ------------------------------------------------------------
+# Prints the export lines that make a process live inside the workspace.
+# Everything the app (or Chrome, or the Apify SDK) would otherwise write to
+# $HOME lands under the workspace instead.
+
+ws_env_lines() {
+  local name="$1" d; d="$(ws_dir "$name")"
+  cat <<EOF
+export CWS_WORKSPACE="$name"
+export XDG_CONFIG_HOME="$d/xdg/config"
+export XDG_DATA_HOME="$d/xdg/data"
+export XDG_CACHE_HOME="$d/xdg/cache"
+export XDG_STATE_HOME="$d/xdg/state"
+export XDG_RUNTIME_DIR="$d/runtime"
+export TMPDIR="$d/tmp"
+export CHROME_USER_DATA_DIR="$d/chrome-profile"
+export CHROME_DEBUG_PORT="$(meta_get "$name" CWS_DEBUG_PORT)"
+# Apify SDK v2 and Crawlee (Apify SDK v3+) local storage, isolated per workspace
+export APIFY_LOCAL_STORAGE_DIR="$d/apify-storage"
+export CRAWLEE_STORAGE_DIR="$d/apify-storage"
+export APIFY_HEADLESS=1
+EOF
+}
+
+meta_get() { # name key -> value (empty if missing)
+  local f; f="$(meta_f "$1")"
+  [[ -f "$f" ]] && grep -E "^$2=" "$f" | head -1 | cut -d= -f2- || true
+}
+
+meta_set() { # name key value
+  local f; f="$(meta_f "$1")"
+  if [[ -f "$f" ]] && grep -qE "^$2=" "$f"; then
+    sed -i "s|^$2=.*|$2=$3|" "$f"
+  else
+    printf '%s=%s\n' "$2" "$3" >>"$f"
+  fi
+}
+
+require_ws() { [[ -f "$(meta_f "$1")" ]] || die "workspace '$1' does not exist (cws create $1)"; }
+
+# --- commands ------------------------------------------------------------------
+
+cmd_create() {
+  local name="$1"; valid_name "$name"
+  local d; d="$(ws_dir "$name")"
+  [[ -e "$d" ]] && die "workspace '$name' already exists"
+  mkdir -p "$d"/{xdg/{config,data,cache,state},runtime,chrome-profile,tmp,apify-storage}
+  chmod 700 "$d/runtime"
+  local port; port="$(alloc_port)"
+  {
+    printf 'CWS_NAME=%s\n' "$name"
+    printf 'CWS_CREATED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'CWS_DEBUG_PORT=%s\n' "$port"
+  } >"$(meta_f "$name")"
+  printf 'created workspace %s (debug port %s) at %s\n' "$name" "$port" "$d"
+}
+
+cmd_destroy() {
+  local name="$1" force="${2:-}"
+  require_ws "$name"
+  local pid; pid="$(meta_get "$name" CWS_CHROME_PID)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    [[ "$force" == "--force" ]] || die "chrome still running in '$name' (pid $pid); use --force"
+    kill_tree "$pid"
+    sleep 1
+    kill -9 "$pid" 2>/dev/null || true
+    for child in $(pgrep -P "$pid" 2>/dev/null); do kill -9 "$child" 2>/dev/null || true; done
+  fi
+  rm -rf "$(ws_dir "$name")"
+  printf 'destroyed workspace %s\n' "$name"
+}
+
+cmd_list() {
+  local json="${1:-}" f
+  shopt -s nullglob
+  local metas=("$(cws_root)"/*/meta.env)
+  if [[ "$json" == "--json" ]]; then
+    printf '[\n'; local first=1
+    for f in "${metas[@]}"; do
+      local n; n="$(basename "$(dirname "$f")")"
+      (( first )) || printf ',\n'; first=0
+      printf '  {"name":"%s","debug_port":%s,"created_at":"%s","running":%s}' \
+        "$n" "$(meta_get "$n" CWS_DEBUG_PORT)" "$(meta_get "$n" CWS_CREATED_AT)" \
+        "$([[ -n "$(meta_get "$n" CWS_CHROME_PID)" ]] && kill -0 "$(meta_get "$n" CWS_CHROME_PID)" 2>/dev/null && echo true || echo false)"
+    done
+    printf '\n]\n'
+  else
+    printf '%-24s %-8s %-8s %s\n' NAME PORT RUNNING CREATED
+    for f in "${metas[@]}"; do
+      local n pid running=no; n="$(basename "$(dirname "$f")")"
+      pid="$(meta_get "$n" CWS_CHROME_PID)"
+      [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && running=yes
+      printf '%-24s %-8s %-8s %s\n' "$n" "$(meta_get "$n" CWS_DEBUG_PORT)" "$running" "$(meta_get "$n" CWS_CREATED_AT)"
+    done
+  fi
+}
+
+cmd_env() { require_ws "$1"; ws_env_lines "$1"; }
+
+cmd_launch() {
+  local name="$1"; shift; require_ws "$name"
+  local mode="--headless" memory="" cpu="" extra="" chrome=""
+  while (( $# )); do
+    case "$1" in
+      --headed)   mode="--headed";;
+      --headless) mode="--headless";;
+      --memory)   memory="$2"; shift;;
+      --cpu)      cpu="$2"; shift;;
+      --chrome)   chrome="$2"; shift;;
+      --)         shift; extra="$*"; break;;
+      *)          die "unknown launch flag: $1";;
+    esac; shift
+  done
+  [[ -z "$chrome" ]] && chrome="$(find_chrome)"
+  local d port pid_old; d="$(ws_dir "$name")"; port="$(meta_get "$name" CWS_DEBUG_PORT)"
+  pid_old="$(meta_get "$name" CWS_CHROME_PID)"
+  [[ -n "$pid_old" ]] && kill -0 "$pid_old" 2>/dev/null && die "chrome already running in '$name' (pid $pid_old)"
+
+  local -a args=(
+    "--user-data-dir=$d/chrome-profile"
+    "--remote-debugging-port=$port"
+    "--no-first-run" "--no-default-browser-check"
+    "--disable-session-crashed-bubble" "--hide-crash-restore-bubble"
+  )
+  if [[ "$mode" == "--headless" ]]; then
+    args+=("--headless=new" "--disable-gpu" "--disable-dev-shm-usage")
+  fi
+  # Containers/LXCs without user-namespace setup need this; harmless otherwise
+  # on already-unprivileged workloads. Drop with CWS_NO_SANDBOX=0.
+  [[ "${CWS_NO_SANDBOX:-1}" == "1" ]] && args+=("--no-sandbox")
+  if [[ -n "$extra" ]]; then
+    local -a extra_args; read -ra extra_args <<<"$extra"; args+=("${extra_args[@]}")
+  fi
+
+  local -a runner=()
+  if [[ -n "$memory" || -n "$cpu" ]] && systemd_run_usable; then
+    runner=(systemd-run --scope --quiet "--unit=cws-$name")
+    [[ -n "$memory" ]] && runner+=("--property=MemoryMax=$memory")
+    [[ -n "$cpu" ]]    && runner+=("--property=CPUQuota=$cpu")
+  elif [[ -n "$memory" || -n "$cpu" ]]; then
+    printf 'cws: warning: systemd-run unavailable; launching without resource limits\n' >&2
+  fi
+
+  (
+    eval "$(ws_env_lines "$name")"
+    export HOME="$d/xdg"   # belt-and-braces: anything ignoring XDG stays in-workspace
+    cd "$d"
+    exec "${runner[@]}" "$chrome" "${args[@]}" >>"$d/xdg/state/chrome.log" 2>&1
+  ) &
+  local pid=$!
+  meta_set "$name" CWS_CHROME_PID "$pid"
+  printf 'launched %s chrome in workspace %s (pid %s, debug port %s, profile %s)\n' \
+    "$mode" "$name" "$pid" "$port" "$d/chrome-profile"
+}
+
+# systemd-run exists in many containers where systemd is not actually PID 1;
+# probe it once so we only use the limits path when it really works.
+systemd_run_usable() {
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  [[ -d /run/systemd/system ]] || return 1
+  # exists-but-not-usable is common in containers (polkit auth, no systemd PID1)
+  timeout 5 systemd-run --scope --quiet /bin/true </dev/null >/dev/null 2>&1
+}
+
+# Kill a pid and everything it spawned (chrome is a process tree, not a pid).
+kill_tree() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$child"; done
+  kill "$pid" 2>/dev/null || true
+}
+
+cmd_stop() {
+  local name="$1"; require_ws "$name"
+  local pid; pid="$(meta_get "$name" CWS_CHROME_PID)"
+  [[ -z "$pid" ]] && die "no chrome recorded for '$name'"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill_tree "$pid"
+    for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    kill -9 "$pid" 2>/dev/null || true
+    for child in $(pgrep -P "$pid" 2>/dev/null); do kill -9 "$child" 2>/dev/null || true; done
+  fi
+  meta_set "$name" CWS_CHROME_PID ""
+  printf 'stopped chrome in workspace %s\n' "$name"
+}
+
+cmd_run() { # cws run NAME -- cmd args...   (also: cws apify NAME -- cmd...)
+  local name="$1"; shift; require_ws "$name"
+  [[ "${1:-}" == "--" ]] && shift
+  (( $# )) || die "cws run $name -- <command>"
+  (
+    eval "$(ws_env_lines "$name")"
+    export HOME="$(ws_dir "$name")/xdg"
+    exec "$@"
+  )
+}
+
+cmd_doctor() {
+  printf 'cws %s\n' "$CWS_VERSION"
+  printf 'root:   %s\n' "$(cws_root)"
+  printf 'chrome: %s\n' "$(find_chrome 2>/dev/null || echo 'NOT FOUND (set CWS_CHROME)')"
+  printf 'systemd-run: %s\n' "$(command -v systemd-run >/dev/null && echo yes || echo 'no (resource limits unavailable)')"
+  printf 'workspaces: %s\n' "$(find "$(cws_root)" -name meta.env 2>/dev/null | wc -l)"
+}
+
+usage() {
+  cat <<'EOF'
+cws - XDG-isolated Chrome workspaces on one Linux box/LXC
+
+  cws create NAME                 create an isolated workspace
+  cws destroy NAME [--force]      remove it (kills its chrome with --force)
+  cws list [--json]               list workspaces
+  cws env NAME                    print export lines (eval "$(cws env NAME)")
+  cws launch NAME [flags] [-- extra chrome flags]
+        --headless (default) | --headed     (headed: for tuxee GUI terminals)
+        --memory 2G --cpu 150%              resource limits via systemd-run
+        --chrome /path/to/chrome
+  cws stop NAME                   stop a workspace's chrome
+  cws run NAME -- CMD...          run any command inside the workspace env
+  cws apify NAME -- CMD...        alias of run, for Apify/Crawlee actors
+  cws doctor                      check prerequisites
+
+Env: CWS_ROOT (workspace root), CWS_CHROME (chrome binary),
+     CWS_PORT_BASE (default 9300), CWS_NO_SANDBOX=0 (keep chrome sandbox)
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    create)  (( $# == 1 )) || die "usage: cws create NAME"; cmd_create "$1";;
+    destroy) (( $# >= 1 )) || die "usage: cws destroy NAME [--force]"; cmd_destroy "$@";;
+    list)    cmd_list "${1:-}";;
+    env)     (( $# == 1 )) || die "usage: cws env NAME"; cmd_env "$1";;
+    launch)  (( $# >= 1 )) || die "usage: cws launch NAME ..."; cmd_launch "$@";;
+    stop)    (( $# == 1 )) || die "usage: cws stop NAME"; cmd_stop "$1";;
+    run|apify) cmd_run "$@";;
+    doctor)  cmd_doctor;;
+    -h|--help|help|"") usage;;
+    *) die "unknown command: $cmd (try cws --help)";;
+  esac
+}
+
+main "$@"

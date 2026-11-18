@@ -1,0 +1,5 @@
+node_modules/
+*.log
+.env
+apify-storage/
+examples/apify-parallel/actor/storage/

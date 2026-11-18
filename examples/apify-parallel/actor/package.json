@@ -1,0 +1,14 @@
+{
+  "name": "cws-example-actor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Example actor: attaches to its cws workspace Chrome via CDP, stores into the workspace's isolated Crawlee storage.",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "crawlee": "^3.0.0",
+    "puppeteer-core": "^22.0.0"
+  }
+}
